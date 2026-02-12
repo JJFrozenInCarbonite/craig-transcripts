@@ -1,21 +1,38 @@
 import io
 import json
+import logging
 import os
 import re
 import sqlite3
+import time
 import zipfile
 from datetime import datetime, timezone
-from typing import Optional, Tuple
+from pathlib import Path
+from typing import Any, Callable, Optional, Tuple
+
+from dotenv import load_dotenv
+
+# Load .env from the script's directory so CRAIG_PARENT_FOLDER_ID, DISCORD_WEBHOOK_URL, etc. are set
+load_dotenv(Path(__file__).resolve().parent / ".env")
 
 import requests
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaIoBaseDownload
 
 # =======================
 # CONFIG
 # =======================
-SERVICE_ACCOUNT_JSON = "/opt/craig-transcripts/service-account.json"
+logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+
+_SCRIPT_DIR = Path(__file__).resolve().parent
+
+def _path_from_env(name: str, default_path: Path) -> str:
+    val = os.environ.get(name)
+    return val.strip() if val and val.strip() else str(default_path)
+
+SERVICE_ACCOUNT_JSON = _path_from_env("SERVICE_ACCOUNT_JSON", _SCRIPT_DIR / "service-account.json")
 
 # Secrets: set via environment (e.g. export in shell, systemd Environment=, or .env)
 def _get_required_env(name: str) -> str:
@@ -31,8 +48,9 @@ def _get_required_env(name: str) -> str:
 CRAIG_PARENT_FOLDER_ID = _get_required_env("CRAIG_PARENT_FOLDER_ID")
 DISCORD_WEBHOOK_URL = _get_required_env("DISCORD_WEBHOOK_URL")
 
-WORK_DIR = "/opt/craig-transcripts/work"
-DB_PATH = "/opt/craig-transcripts/state.db"
+WORK_DIR = _path_from_env("WORK_DIR", _SCRIPT_DIR / "work")
+DB_PATH = _path_from_env("DB_PATH", _SCRIPT_DIR / "state.db")
+ARCHIVE_DIR = _path_from_env("ARCHIVE_DIR", _SCRIPT_DIR / "archive")
 
 # Run via cron every 5 min; flock prevents overlap if a run exceeds 5 min (next run skips):
 #   */5 * * * * flock -n /opt/craig-transcripts/craig_worker.lock bash -c 'cd /opt/craig-transcripts && . .env && ./venv/bin/python craig_worker.py'
@@ -44,6 +62,7 @@ ZIP_NAME_RE = re.compile(r"_(\d{4})-(\d{1,2})-(\d{1,2})_(\d{1,2})-(\d{1,2})-(\d{
 # =======================
 def ensure_dirs() -> None:
     os.makedirs(WORK_DIR, exist_ok=True)
+    os.makedirs(ARCHIVE_DIR, exist_ok=True)
 
 def init_db() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
@@ -156,16 +175,45 @@ def vtt_to_markdown(vtt_text: str) -> str:
     return "\n".join(out_lines).strip() + "\n"
 
 # =======================
+# Retry helper
+# =======================
+def _is_retryable(e: Exception) -> bool:
+    """True for transient errors (5xx, 429, network)."""
+    if isinstance(e, HttpError):
+        return e.resp.status in (429, 500, 502, 503, 504)
+    if isinstance(e, requests.RequestException):
+        return True
+    return False
+
+
+def with_retry(fn: Callable[[], Any], max_attempts: int = 3, delay: float = 2.0) -> Any:
+    """Run fn(); on transient errors, sleep and retry up to max_attempts."""
+    last: Optional[Exception] = None
+    for attempt in range(max_attempts):
+        try:
+            return fn()
+        except Exception as e:
+            last = e
+            if attempt < max_attempts - 1 and _is_retryable(e):
+                logging.warning("Transient error (attempt %d/%d): %s", attempt + 1, max_attempts, e)
+                time.sleep(delay * (attempt + 1))
+            else:
+                raise
+    if last is not None:
+        raise last
+    raise RuntimeError("unreachable")
+
+# =======================
 # Google Drive API
 # =======================
-def drive_service():
+def drive_service() -> Any:
     scopes = ["https://www.googleapis.com/auth/drive"]
     creds = service_account.Credentials.from_service_account_file(
         SERVICE_ACCOUNT_JSON, scopes=scopes
     )
     return build("drive", "v3", credentials=creds, cache_discovery=False)
 
-def list_craig_zips(svc, folder_id: str):
+def list_craig_zips(svc: Any, folder_id: str) -> list[dict]:
     q = (
         f"'{folder_id}' in parents and trashed = false "
         f"and name contains 'craig_' and name contains '.zip'"
@@ -189,7 +237,7 @@ def list_craig_zips(svc, folder_id: str):
             break
     return files
 
-def download_drive_file(svc, file_id: str, dest_path: str) -> None:
+def download_drive_file(svc: Any, file_id: str, dest_path: str) -> None:
     request = svc.files().get_media(fileId=file_id)
     with io.FileIO(dest_path, "wb") as fh:
         downloader = MediaIoBaseDownload(fh, request, chunksize=1024 * 1024 * 8)
@@ -209,12 +257,17 @@ def extract_transcription_vtt(zip_path: str) -> Optional[str]:
         with z.open(target) as f:
             return f.read().decode("utf-8", errors="replace")
 
-def ensure_anyone_with_link(svc, file_id: str) -> None:
+def ensure_anyone_with_link(svc: Any, file_id: str) -> None:
     perm = {"type": "anyone", "role": "reader"}
     try:
         svc.permissions().create(fileId=file_id, body=perm, fields="id").execute()
-    except Exception:
-        pass
+    except HttpError as e:
+        if e.resp.status == 409:
+            logging.debug("Permission already exists for file %s", file_id)
+        else:
+            logging.warning("Failed to set anyone-with-link for file %s: %s", file_id, e)
+    except Exception as e:
+        logging.warning("Unexpected error setting permission for file %s: %s", file_id, e)
 
 # =======================
 # Discord webhook
@@ -248,7 +301,7 @@ def post_discord_with_file(
 # =======================
 # Worker loop
 # =======================
-def run_once(svc, conn: sqlite3.Connection) -> None:
+def run_once(svc: Any, conn: sqlite3.Connection) -> None:
     files = list_craig_zips(svc, CRAIG_PARENT_FOLDER_ID)
     if not files:
         return
@@ -267,63 +320,70 @@ def run_once(svc, conn: sqlite3.Connection) -> None:
         local_zip_path = os.path.join(WORK_DIR, name)
         local_md_path = os.path.join(WORK_DIR, md_name)
 
-        print(f"Processing: {name}")
+        try:
+            logging.info("Processing: %s", name)
 
-        ensure_anyone_with_link(svc, file_id)
-        zip_link = build_drive_download_link(file_id)
+            ensure_anyone_with_link(svc, file_id)
+            zip_link = build_drive_download_link(file_id)
 
-        download_drive_file(svc, file_id, local_zip_path)
+            with_retry(lambda: download_drive_file(svc, file_id, local_zip_path))
 
-        vtt = extract_transcription_vtt(local_zip_path)
-        if not vtt:
-            print(f"No transcription.vtt found inside {name}")
+            vtt = extract_transcription_vtt(local_zip_path)
+            if not vtt:
+                logging.warning("No transcription.vtt found inside %s", name)
+                continue
+
+            md = vtt_to_markdown(vtt)
+            with open(local_md_path, "w", encoding="utf-8") as out:
+                out.write(md)
+
+            # Build Discord message: info + transcript (truncated if needed); attach .md file
+            info_lines = [
+                "**Craig recording processed**",
+                f"Recording time (UTC): {iso_utc}",
+                f"Recording ZIP (download): {zip_link}",
+                "",
+            ]
+            info_block = "\n".join(info_lines)
+            full_transcript_block = f"**Transcript:**\n```markdown\n{md}\n```"
+            content = info_block + full_transcript_block
+            if len(content) > DISCORD_CONTENT_LIMIT:
+                trailer = "\n```\n*(Full transcript in attached file)*"
+                prefix = info_block + "**Transcript (preview):**\n```markdown\n"
+                max_md = DISCORD_CONTENT_LIMIT - len(prefix) - len(trailer) - 4
+                content = prefix + md[:max_md] + "\n..." + trailer
+            with_retry(
+                lambda: post_discord_with_file(DISCORD_WEBHOOK_URL, content, local_md_path, md_name)
+            )
+
+            mark_processed(conn, file_id)
+
+            # Cleanup local
+            try:
+                os.remove(local_zip_path)
+            except OSError as e:
+                logging.warning("Failed to remove zip %s: %s", local_zip_path, e)
+            try:
+                os.makedirs(ARCHIVE_DIR, exist_ok=True)
+                archived_md_path = os.path.join(ARCHIVE_DIR, md_name)
+                os.replace(local_md_path, archived_md_path)
+            except OSError as e:
+                logging.warning("Failed to archive %s: %s", local_md_path, e)
+        except Exception as e:
+            logging.exception("Error processing %s: %s", name, e)
             continue
-
-        md = vtt_to_markdown(vtt)
-        with open(local_md_path, "w", encoding="utf-8") as out:
-            out.write(md)
-
-        # Build Discord message: info + transcript (truncated if needed); attach .md file
-        info_lines = [
-            "**Craig recording processed**",
-            f"Recording time (UTC): {iso_utc}",
-            f"Recording ZIP (download): {zip_link}",
-            "",
-        ]
-        info_block = "\n".join(info_lines)
-        full_transcript_block = f"**Transcript:**\n```markdown\n{md}\n```"
-        content = info_block + full_transcript_block
-        if len(content) > DISCORD_CONTENT_LIMIT:
-            trailer = "\n```\n*(Full transcript in attached file)*"
-            prefix = info_block + "**Transcript (preview):**\n```markdown\n"
-            max_md = DISCORD_CONTENT_LIMIT - len(prefix) - len(trailer) - 4
-            content = prefix + md[:max_md] + "\n..." + trailer
-        post_discord_with_file(DISCORD_WEBHOOK_URL, content, local_md_path, md_name)
-
-        mark_processed(conn, file_id)
-
-        # Cleanup local
-        try:
-            os.remove(local_zip_path)
-        except OSError:
-            pass
-        try:
-            ARCHIVE_DIR = "/opt/craig-transcripts/archive"
-            os.makedirs(ARCHIVE_DIR, exist_ok=True)
-            archived_md_path = os.path.join(ARCHIVE_DIR, md_name)
-            os.replace(local_md_path, archived_md_path)
-        except OSError:
-            pass
 
 def main() -> None:
     ensure_dirs()
     conn = init_db()
-    svc = drive_service()
     try:
+        svc = drive_service()
         run_once(svc, conn)
-    except Exception as e:
-        print(f"Error: {e}")
+    except Exception:
+        logging.exception("Fatal error")
         raise
+    finally:
+        conn.close()
 
 if __name__ == "__main__":
     main()
